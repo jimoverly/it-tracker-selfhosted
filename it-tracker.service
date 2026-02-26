@@ -1,0 +1,19 @@
+[Unit]
+Description=IT Integration Tracker
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/it-tracker
+ExecStart=/usr/bin/node /opt/it-tracker/server.js
+Restart=on-failure
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=it-tracker
+Environment=NODE_ENV=production
+Environment=PORT=3000
+
+[Install]
+WantedBy=multi-user.target
