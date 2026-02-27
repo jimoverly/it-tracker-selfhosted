@@ -14,16 +14,27 @@ if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => cb(null, Date.now() + '-' + Math.round(Math.random() * 1E9) + '-' + file.originalname)
+    filename: (req, file, cb) => {
+        const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+        cb(null, Date.now() + '-' + Math.round(Math.random() * 1E9) + '-' + safeName);
+    }
 });
-const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
+const allowedExtensions = /\.(pdf|doc|docx|xls|xlsx|ppt|pptx|png|jpg|jpeg|gif|bmp|txt|csv|zip|msg|eml)$/i;
+const upload = multer({
+    storage,
+    limits: { fileSize: 10 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        if (allowedExtensions.test(file.originalname)) cb(null, true);
+        else cb(new Error('File type not allowed'), false);
+    }
+});
 
-app.use(cors());
+app.use(cors({ origin: process.env.CORS_ORIGIN || true }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(uploadDir));
 
-const db = new sqlite3.Database('./tracker.db', (err) => {
+const db = new sqlite3.Database(process.env.DB_PATH || './tracker.db', (err) => {
     if (err) console.error('Database error:', err);
     else { console.log('Connected to SQLite'); initDB(); }
 });
@@ -31,6 +42,16 @@ const db = new sqlite3.Database('./tracker.db', (err) => {
 const hash = p => crypto.createHash('sha256').update(p).digest('hex');
 const genToken = () => crypto.randomBytes(32).toString('hex');
 const sessions = new Map();
+
+// Clean up expired sessions every hour
+setInterval(() => {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [token, session] of sessions) {
+        if (session.expires < now) { sessions.delete(token); cleaned++; }
+    }
+    if (cleaned > 0) console.log(`Session cleanup: removed ${cleaned} expired sessions`);
+}, 3600000);
 
 const ROLES = {
     readonly: { level: 1, canRead: true, canEdit: false, canAddTasks: false, canAdmin: false },
@@ -136,13 +157,38 @@ function seedProjectData(pid) {
     [['RISK-001','Data loss during migration','Office 365','Medium','High','Comprehensive backup'],['RISK-002','Network connectivity issues','Network','Medium','High','Redundant connections'],['RISK-003','Security vulnerabilities','Cybersecurity','High','High','Security assessment']].forEach(r => db.run(`INSERT INTO risks (id,project_id,description,workstream,likelihood,impact,mitigation) VALUES (?,?,?,?,?,?,?)`, [r[0],pid,r[1],r[2],r[3],r[4],r[5]]));
 }
 
-// AUTH
+// AUTH - with rate limiting
+const loginAttempts = new Map();
+const MAX_LOGIN_ATTEMPTS = 5;
+const LOGIN_LOCKOUT_MS = 900000; // 15 minutes
+
 app.post('/api/auth/login', (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Credentials required' });
+    
+    // Rate limiting by IP
+    const ip = req.ip || req.connection.remoteAddress;
+    const attempts = loginAttempts.get(ip);
+    if (attempts && attempts.count >= MAX_LOGIN_ATTEMPTS && Date.now() - attempts.first < LOGIN_LOCKOUT_MS) {
+        const remaining = Math.ceil((LOGIN_LOCKOUT_MS - (Date.now() - attempts.first)) / 60000);
+        return res.status(429).json({ error: `Too many attempts. Try again in ${remaining} minutes` });
+    }
+    
     db.get("SELECT * FROM users WHERE username=? AND active=1", [username], (e, u) => {
-        if (e) return res.status(500).json({ error: e.message });
-        if (!u || u.password !== hash(password)) return res.status(401).json({ error: 'Invalid credentials' });
+        if (e) return res.status(500).json({ error: 'Database error' });
+        if (!u || u.password !== hash(password)) {
+            // Track failed attempt
+            const now = Date.now();
+            const prev = loginAttempts.get(ip);
+            if (prev && now - prev.first < LOGIN_LOCKOUT_MS) {
+                prev.count++;
+            } else {
+                loginAttempts.set(ip, { count: 1, first: now });
+            }
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        // Clear attempts on success
+        loginAttempts.delete(ip);
         const token = genToken();
         sessions.set(token, { user: { id: u.id, username: u.username, display_name: u.display_name, email: u.email, role: u.role }, expires: Date.now() + 86400000 });
         db.run("UPDATE users SET last_login=CURRENT_TIMESTAMP WHERE id=?", [u.id]);
@@ -155,25 +201,38 @@ app.get('/api/auth/me', auth, (req, res) => res.json({ user: req.user, permissio
 
 app.post('/api/auth/change-password', auth, (req, res) => {
     const { currentPassword, newPassword } = req.body;
+    if (!newPassword || newPassword.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
     db.get("SELECT password FROM users WHERE id=?", [req.user.id], (e, u) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        if (!u) return res.status(404).json({ error: 'User not found' });
         if (u.password !== hash(currentPassword)) return res.status(401).json({ error: 'Wrong password' });
-        db.run("UPDATE users SET password=? WHERE id=?", [hash(newPassword), req.user.id], () => res.json({ ok: true }));
+        db.run("UPDATE users SET password=? WHERE id=?", [hash(newPassword), req.user.id], (e) => {
+            if (e) return res.status(500).json({ error: 'Database error' });
+            res.json({ ok: true });
+        });
     });
 });
 
 // USERS
 app.get('/api/users', auth, reqRole('admin'), (req, res) => {
-    db.all("SELECT id,username,display_name,email,role,active,created_at,last_login FROM users ORDER BY username", (e, r) => res.json(r || []));
+    db.all("SELECT id,username,display_name,email,role,active,created_at,last_login FROM users ORDER BY username", (e, r) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json(r || []);
+    });
 });
 
 // Get active users for dropdowns (all authenticated users can access)
 app.get('/api/users/list', auth, (req, res) => {
-    db.all("SELECT id,username,display_name,role FROM users WHERE active=1 ORDER BY display_name,username", (e, r) => res.json(r || []));
+    db.all("SELECT id,username,display_name,role FROM users WHERE active=1 ORDER BY display_name,username", (e, r) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json(r || []);
+    });
 });
 
 app.post('/api/users', auth, reqRole('admin'), (req, res) => {
     const { username, password, display_name, email, role } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Required' });
+    if (password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
     if (!['readonly','edit','teamlead','admin'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
     db.run(`INSERT INTO users (username,password,display_name,email,role) VALUES (?,?,?,?,?)`, [username, hash(password), display_name, email, role], function(e) {
         if (e) return res.status(500).json({ error: e.message.includes('UNIQUE') ? 'Username exists' : e.message });
@@ -184,14 +243,20 @@ app.post('/api/users', auth, reqRole('admin'), (req, res) => {
 app.put('/api/users/:id', auth, reqRole('admin'), (req, res) => {
     const { display_name, email, role, active } = req.body;
     if (parseInt(req.params.id) === req.user.id && role !== 'admin') return res.status(400).json({ error: 'Cannot change own role' });
-    db.run(`UPDATE users SET display_name=?,email=?,role=?,active=? WHERE id=?`, [display_name, email, role, active?1:0, req.params.id], function(e) { res.json({ changes: this.changes }); });
+    db.run(`UPDATE users SET display_name=?,email=?,role=?,active=? WHERE id=?`, [display_name, email, role, active?1:0, req.params.id], function(e) {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json({ changes: this.changes });
+    });
 });
 
 app.post('/api/users/:id/reset-password', auth, reqRole('admin'), (req, res) => {
     const { newPassword } = req.body;
+    if (!newPassword || newPassword.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
     db.get("SELECT username FROM users WHERE id=?", [req.params.id], (e, u) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
         if (!u) return res.status(404).json({ error: 'Not found' });
-        db.run("UPDATE users SET password=? WHERE id=?", [hash(newPassword), req.params.id], () => {
+        db.run("UPDATE users SET password=? WHERE id=?", [hash(newPassword), req.params.id], (e) => {
+            if (e) return res.status(500).json({ error: 'Database error' });
             res.json({ ok: true });
         });
     });
@@ -199,42 +264,86 @@ app.post('/api/users/:id/reset-password', auth, reqRole('admin'), (req, res) => 
 
 app.delete('/api/users/:id', auth, reqRole('admin'), (req, res) => {
     if (parseInt(req.params.id) === req.user.id) return res.status(400).json({ error: 'Cannot delete self' });
-    db.run("DELETE FROM users WHERE id=?", [req.params.id], function(e) { res.json({ changes: this.changes }); });
+    db.run("DELETE FROM users WHERE id=?", [req.params.id], function(e) {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json({ changes: this.changes });
+    });
 });
 
 // WORKSTREAMS
-app.get('/api/admin/workstreams', auth, (req, res) => { db.all("SELECT * FROM default_workstreams ORDER BY sort_order", (e, r) => res.json(r || [])); });
+app.get('/api/admin/workstreams', auth, (req, res) => {
+    db.all("SELECT * FROM default_workstreams ORDER BY sort_order", (e, r) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json(r || []);
+    });
+});
 app.post('/api/admin/workstreams', auth, reqRole('admin'), (req, res) => {
     const { name, color } = req.body;
-    db.run(`INSERT INTO default_workstreams (name,color,sort_order) VALUES (?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM default_workstreams))`, [name, color||'#718096'], function(e) { res.json({ id: this.lastID }); });
+    if (!name) return res.status(400).json({ error: 'Name required' });
+    db.run(`INSERT INTO default_workstreams (name,color,sort_order) VALUES (?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM default_workstreams))`, [name, color||'#718096'], function(e) {
+        if (e) return res.status(500).json({ error: e.message });
+        res.json({ id: this.lastID });
+    });
 });
 app.put('/api/admin/workstreams/:id', auth, reqRole('admin'), (req, res) => {
     const { name, color, sort_order, active } = req.body;
-    db.run(`UPDATE default_workstreams SET name=?,color=?,sort_order=?,active=? WHERE id=?`, [name, color, sort_order, active?1:0, req.params.id], function(e) { res.json({ changes: this.changes }); });
+    db.run(`UPDATE default_workstreams SET name=?,color=?,sort_order=?,active=? WHERE id=?`, [name, color, sort_order, active?1:0, req.params.id], function(e) {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json({ changes: this.changes });
+    });
 });
-app.delete('/api/admin/workstreams/:id', auth, reqRole('admin'), (req, res) => { db.run("DELETE FROM default_workstreams WHERE id=?", [req.params.id], function(e) { res.json({ changes: this.changes }); }); });
+app.delete('/api/admin/workstreams/:id', auth, reqRole('admin'), (req, res) => {
+    db.run("DELETE FROM default_workstreams WHERE id=?", [req.params.id], function(e) {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json({ changes: this.changes });
+    });
+});
 
 // DEFAULT TASKS
-app.get('/api/admin/default-tasks', auth, (req, res) => { db.all("SELECT * FROM default_tasks ORDER BY workstream,sort_order", (e, r) => res.json(r || [])); });
+app.get('/api/admin/default-tasks', auth, (req, res) => {
+    db.all("SELECT * FROM default_tasks ORDER BY workstream,sort_order", (e, r) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json(r || []);
+    });
+});
 app.post('/api/admin/default-tasks', auth, reqRole('admin'), (req, res) => {
     const { id, workstream, name, description, priority, dependencies } = req.body;
     if (!id || !workstream || !name) return res.status(400).json({ error: 'Required fields' });
     db.run(`INSERT INTO default_tasks (id,workstream,name,description,priority,dependencies,sort_order) VALUES (?,?,?,?,?,?,(SELECT COALESCE(MAX(sort_order),0)+1 FROM default_tasks WHERE workstream=?))`,
-        [id, workstream, name, description, priority||'Medium', dependencies||'', workstream], function(e) { res.json({ ok: true }); });
+        [id, workstream, name, description, priority||'Medium', dependencies||'', workstream], function(e) {
+            if (e) return res.status(500).json({ error: e.message });
+            res.json({ ok: true });
+        });
 });
 app.put('/api/admin/default-tasks/:id', auth, reqRole('admin'), (req, res) => {
     const { workstream, name, description, priority, dependencies, sort_order, active } = req.body;
     db.run(`UPDATE default_tasks SET workstream=?,name=?,description=?,priority=?,dependencies=?,sort_order=?,active=? WHERE id=?`,
-        [workstream, name, description, priority, dependencies, sort_order, active?1:0, req.params.id], function(e) { res.json({ changes: this.changes }); });
+        [workstream, name, description, priority, dependencies, sort_order, active?1:0, req.params.id], function(e) {
+            if (e) return res.status(500).json({ error: 'Database error' });
+            res.json({ changes: this.changes });
+        });
 });
-app.delete('/api/admin/default-tasks/:id', auth, reqRole('admin'), (req, res) => { db.run("DELETE FROM default_tasks WHERE id=?", [req.params.id], function(e) { res.json({ changes: this.changes }); }); });
+app.delete('/api/admin/default-tasks/:id', auth, reqRole('admin'), (req, res) => {
+    db.run("DELETE FROM default_tasks WHERE id=?", [req.params.id], function(e) {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json({ changes: this.changes });
+    });
+});
 
 // PROJECTS
 app.get('/api/projects', auth, (req, res) => {
-    db.all(`SELECT p.*, (SELECT COUNT(*) FROM tasks WHERE project_id=p.id) as task_count, (SELECT COUNT(*) FROM tasks WHERE project_id=p.id AND status='Complete') as completed_count, (SELECT AVG(percent_complete) FROM tasks WHERE project_id=p.id) as overall_progress FROM projects p ORDER BY created_at DESC`, (e, r) => res.json(r || []));
+    db.all(`SELECT p.*, (SELECT COUNT(*) FROM tasks WHERE project_id=p.id) as task_count, (SELECT COUNT(*) FROM tasks WHERE project_id=p.id AND status='Complete') as completed_count, (SELECT AVG(percent_complete) FROM tasks WHERE project_id=p.id) as overall_progress FROM projects p ORDER BY created_at DESC`, (e, r) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json(r || []);
+    });
 });
 
-app.get('/api/projects/:id', auth, (req, res) => { db.get("SELECT * FROM projects WHERE id=?", [req.params.id], (e, r) => r ? res.json(r) : res.status(404).json({ error: 'Not found' })); });
+app.get('/api/projects/:id', auth, (req, res) => {
+    db.get("SELECT * FROM projects WHERE id=?", [req.params.id], (e, r) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        r ? res.json(r) : res.status(404).json({ error: 'Not found' });
+    });
+});
 
 app.post('/api/projects', auth, reqRole('admin'), (req, res) => {
     const { name, description, acquired_company, parent_company, start_date, target_completion } = req.body;
@@ -250,15 +359,24 @@ app.put('/api/projects/:id', auth, reqRole('admin'), (req, res) => {
 });
 
 app.delete('/api/projects/:id', auth, reqRole('admin'), (req, res) => {
-    db.all("SELECT filename FROM task_attachments WHERE project_id=?", [req.params.id], (e, files) => {
-        (files||[]).forEach(f => { const p = path.join(uploadDir, f.filename); if (fs.existsSync(p)) fs.unlinkSync(p); });
-    });
-    db.serialize(() => {
-        db.run("DELETE FROM task_attachments WHERE project_id=?", [req.params.id]);
-        db.run("DELETE FROM tasks WHERE project_id=?", [req.params.id]);
-        db.run("DELETE FROM contacts WHERE project_id=?", [req.params.id]);
-        db.run("DELETE FROM risks WHERE project_id=?", [req.params.id]);
-        db.run("DELETE FROM projects WHERE id=?", [req.params.id], function(e) { res.json({ changes: this.changes }); });
+    const pid = req.params.id;
+    // First clean up attachment files, then delete all records
+    db.all("SELECT filename FROM task_attachments WHERE project_id=?", [pid], (e, files) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        (files||[]).forEach(f => {
+            const p = path.join(uploadDir, f.filename);
+            try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch(err) { console.error('File cleanup error:', err); }
+        });
+        db.serialize(() => {
+            db.run("DELETE FROM task_attachments WHERE project_id=?", [pid]);
+            db.run("DELETE FROM tasks WHERE project_id=?", [pid]);
+            db.run("DELETE FROM contacts WHERE project_id=?", [pid]);
+            db.run("DELETE FROM risks WHERE project_id=?", [pid]);
+            db.run("DELETE FROM projects WHERE id=?", [pid], function(e) {
+                if (e) return res.status(500).json({ error: 'Database error' });
+                res.json({ changes: this.changes });
+            });
+        });
     });
 });
 
@@ -274,17 +392,24 @@ app.get('/api/my-tasks', auth, (req, res) => {
             CASE WHEN t.status='Blocked' THEN 0 WHEN t.status='In Progress' THEN 1 WHEN t.status='Not Started' THEN 2 ELSE 3 END,
             CASE WHEN t.due_date IS NULL OR t.due_date='' THEN '9999-99-99' ELSE t.due_date END,
             t.priority`, 
-        [username], (e, r) => res.json(r || []));
+        [username], (e, r) => {
+            if (e) return res.status(500).json({ error: 'Database error' });
+            res.json(r || []);
+        });
 });
 
 // EXPORT
 app.get('/api/projects/:id/export', auth, (req, res) => {
     const pid = req.params.id;
     db.get("SELECT * FROM projects WHERE id=?", [pid], (e, project) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
         if (!project) return res.status(404).json({ error: 'Not found' });
         db.all("SELECT * FROM tasks WHERE project_id=? ORDER BY workstream,id", [pid], (e, tasks) => {
+            if (e) return res.status(500).json({ error: 'Database error' });
             db.all("SELECT * FROM contacts WHERE project_id=?", [pid], (e, contacts) => {
+                if (e) return res.status(500).json({ error: 'Database error' });
                 db.all("SELECT * FROM risks WHERE project_id=?", [pid], (e, risks) => {
+                    if (e) return res.status(500).json({ error: 'Database error' });
                     const ws = [...new Set((tasks||[]).map(t => t.workstream))];
                     const wsStats = ws.map(w => {
                         const wt = tasks.filter(t => t.workstream === w);
@@ -299,82 +424,171 @@ app.get('/api/projects/:id/export', auth, (req, res) => {
 
 // TASKS
 app.get('/api/projects/:pid/tasks', auth, (req, res) => {
-    db.all(`SELECT t.*, (SELECT COUNT(*) FROM task_attachments WHERE task_id=t.id AND project_id=t.project_id) as attachment_count FROM tasks t WHERE t.project_id=? ORDER BY t.id`, [req.params.pid], (e, r) => res.json(r || []));
+    db.all(`SELECT t.*, (SELECT COUNT(*) FROM task_attachments WHERE task_id=t.id AND project_id=t.project_id) as attachment_count FROM tasks t WHERE t.project_id=? ORDER BY t.id`, [req.params.pid], (e, r) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json(r || []);
+    });
 });
 
 app.put('/api/projects/:pid/tasks/:id', auth, reqRole('edit'), (req, res) => {
     const { workstream, name, description, owner, priority, status, start_date, due_date, percent_complete, dependencies, notes } = req.body;
     db.run(`UPDATE tasks SET workstream=?,name=?,description=?,owner=?,priority=?,status=?,start_date=?,due_date=?,percent_complete=?,dependencies=?,notes=?,updated_at=CURRENT_TIMESTAMP,updated_by=? WHERE id=? AND project_id=?`,
-        [workstream, name, description, owner, priority, status, start_date, due_date, percent_complete, dependencies, notes, req.user.username, req.params.id, req.params.pid], function(e) { res.json({ changes: this.changes }); });
+        [workstream, name, description, owner, priority, status, start_date, due_date, percent_complete, dependencies, notes, req.user.username, req.params.id, req.params.pid], function(e) {
+            if (e) return res.status(500).json({ error: 'Database error' });
+            res.json({ changes: this.changes });
+        });
 });
 
 app.post('/api/projects/:pid/tasks', auth, reqRole('teamlead'), (req, res) => {
     const { id, workstream, name, description, owner, priority, status, start_date, due_date, percent_complete, dependencies, notes } = req.body;
+    if (!id || !name) return res.status(400).json({ error: 'Task ID and name required' });
     db.run(`INSERT INTO tasks (id,project_id,workstream,name,description,owner,priority,status,start_date,due_date,percent_complete,dependencies,notes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [id, req.params.pid, workstream, name, description, owner, priority||'Medium', status||'Not Started', start_date, due_date, percent_complete||0, dependencies, notes], function(e) { res.json({ ok: true }); });
+        [id, req.params.pid, workstream, name, description, owner, priority||'Medium', status||'Not Started', start_date, due_date, percent_complete||0, dependencies, notes], function(e) {
+            if (e) return res.status(500).json({ error: e.message });
+            res.json({ ok: true });
+        });
 });
 
 app.delete('/api/projects/:pid/tasks/:id', auth, reqRole('teamlead'), (req, res) => {
-    db.all("SELECT filename FROM task_attachments WHERE task_id=? AND project_id=?", [req.params.id, req.params.pid], (e, files) => {
-        (files||[]).forEach(f => { const p = path.join(uploadDir, f.filename); if (fs.existsSync(p)) fs.unlinkSync(p); });
-        db.run("DELETE FROM task_attachments WHERE task_id=? AND project_id=?", [req.params.id, req.params.pid]);
+    const { id, pid } = req.params;
+    // Sequential: find files → delete files → delete attachment records → delete task
+    db.all("SELECT filename FROM task_attachments WHERE task_id=? AND project_id=?", [id, pid], (e, files) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        (files||[]).forEach(f => {
+            const p = path.join(uploadDir, f.filename);
+            try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch(err) { console.error('File cleanup error:', err); }
+        });
+        db.run("DELETE FROM task_attachments WHERE task_id=? AND project_id=?", [id, pid], (e) => {
+            if (e) return res.status(500).json({ error: 'Database error' });
+            db.run("DELETE FROM tasks WHERE id=? AND project_id=?", [id, pid], function(e) {
+                if (e) return res.status(500).json({ error: 'Database error' });
+                res.json({ changes: this.changes });
+            });
+        });
     });
-    db.run("DELETE FROM tasks WHERE id=? AND project_id=?", [req.params.id, req.params.pid], function(e) { res.json({ changes: this.changes }); });
 });
 
 // ATTACHMENTS
 app.get('/api/projects/:pid/tasks/:tid/attachments', auth, (req, res) => {
-    db.all("SELECT * FROM task_attachments WHERE task_id=? AND project_id=? ORDER BY uploaded_at DESC", [req.params.tid, req.params.pid], (e, r) => res.json(r || []));
+    db.all("SELECT * FROM task_attachments WHERE task_id=? AND project_id=? ORDER BY uploaded_at DESC", [req.params.tid, req.params.pid], (e, r) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json(r || []);
+    });
 });
 
 app.post('/api/projects/:pid/tasks/:tid/attachments', auth, reqRole('edit'), upload.single('file'), (req, res) => {
-    if (!req.file) return res.status(400).json({ error: 'No file' });
+    if (!req.file) return res.status(400).json({ error: 'No file or file type not allowed' });
     db.run(`INSERT INTO task_attachments (task_id,project_id,filename,original_name,file_size,mime_type,uploaded_by) VALUES (?,?,?,?,?,?,?)`,
-        [req.params.tid, req.params.pid, req.file.filename, req.file.originalname, req.file.size, req.file.mimetype, req.user.username], function(e) { res.json({ id: this.lastID, filename: req.file.filename }); });
+        [req.params.tid, req.params.pid, req.file.filename, req.file.originalname, req.file.size, req.file.mimetype, req.user.username], function(e) {
+            if (e) return res.status(500).json({ error: 'Database error' });
+            res.json({ id: this.lastID, filename: req.file.filename });
+        });
 });
 
 app.delete('/api/projects/:pid/tasks/:tid/attachments/:id', auth, reqRole('edit'), (req, res) => {
-    db.get("SELECT filename FROM task_attachments WHERE id=?", [req.params.id], (e, f) => {
+    db.get("SELECT filename FROM task_attachments WHERE id=? AND project_id=?", [req.params.id, req.params.pid], (e, f) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
         if (!f) return res.status(404).json({ error: 'Not found' });
-        const p = path.join(uploadDir, f.filename); if (fs.existsSync(p)) fs.unlinkSync(p);
-        db.run("DELETE FROM task_attachments WHERE id=?", [req.params.id], function(e) { res.json({ ok: true }); });
+        const p = path.join(uploadDir, f.filename);
+        try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch(err) { console.error('File cleanup error:', err); }
+        db.run("DELETE FROM task_attachments WHERE id=?", [req.params.id], function(e) {
+            if (e) return res.status(500).json({ error: 'Database error' });
+            res.json({ ok: true });
+        });
     });
 });
 
 // CONTACTS
-app.get('/api/projects/:pid/contacts', auth, (req, res) => { db.all("SELECT * FROM contacts WHERE project_id=? ORDER BY workstream", [req.params.pid], (e, r) => res.json(r || [])); });
+app.get('/api/projects/:pid/contacts', auth, (req, res) => {
+    db.all("SELECT * FROM contacts WHERE project_id=? ORDER BY workstream", [req.params.pid], (e, r) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json(r || []);
+    });
+});
 
 app.put('/api/projects/:pid/contacts/:id', auth, reqRole('edit'), (req, res) => {
     const { name, role, company, workstream, email, phone } = req.body;
-    db.run(`UPDATE contacts SET name=?,role=?,company=?,workstream=?,email=?,phone=? WHERE id=?`, [name, role, company, workstream, email, phone, req.params.id], function(e) { res.json({ changes: this.changes }); });
+    db.run(`UPDATE contacts SET name=?,role=?,company=?,workstream=?,email=?,phone=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?`, [name, role, company, workstream, email, phone, req.params.id, req.params.pid], function(e) {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json({ changes: this.changes });
+    });
 });
 
 app.post('/api/projects/:pid/contacts', auth, reqRole('teamlead'), (req, res) => {
     const { name, role, company, workstream, email, phone } = req.body;
-    db.run(`INSERT INTO contacts (project_id,name,role,company,workstream,email,phone) VALUES (?,?,?,?,?,?,?)`, [req.params.pid, name, role, company, workstream, email, phone], function(e) { res.json({ id: this.lastID }); });
+    db.run(`INSERT INTO contacts (project_id,name,role,company,workstream,email,phone) VALUES (?,?,?,?,?,?,?)`, [req.params.pid, name, role, company, workstream, email, phone], function(e) {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json({ id: this.lastID });
+    });
+});
+
+app.delete('/api/projects/:pid/contacts/:id', auth, reqRole('teamlead'), (req, res) => {
+    db.run("DELETE FROM contacts WHERE id=? AND project_id=?", [req.params.id, req.params.pid], function(e) {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json({ changes: this.changes });
+    });
 });
 
 // RISKS
-app.get('/api/projects/:pid/risks', auth, (req, res) => { db.all("SELECT * FROM risks WHERE project_id=?", [req.params.pid], (e, r) => res.json(r || [])); });
+app.get('/api/projects/:pid/risks', auth, (req, res) => {
+    db.all("SELECT * FROM risks WHERE project_id=?", [req.params.pid], (e, r) => {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json(r || []);
+    });
+});
 
 app.put('/api/projects/:pid/risks/:id', auth, reqRole('edit'), (req, res) => {
     const { description, workstream, likelihood, impact, mitigation, owner } = req.body;
-    db.run(`UPDATE risks SET description=?,workstream=?,likelihood=?,impact=?,mitigation=?,owner=? WHERE id=? AND project_id=?`, [description, workstream, likelihood, impact, mitigation, owner, req.params.id, req.params.pid], function(e) { res.json({ changes: this.changes }); });
+    db.run(`UPDATE risks SET description=?,workstream=?,likelihood=?,impact=?,mitigation=?,owner=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?`, [description, workstream, likelihood, impact, mitigation, owner, req.params.id, req.params.pid], function(e) {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json({ changes: this.changes });
+    });
 });
 
 app.post('/api/projects/:pid/risks', auth, reqRole('teamlead'), (req, res) => {
     const { id, description, workstream, likelihood, impact, mitigation, owner } = req.body;
-    db.run(`INSERT INTO risks (id,project_id,description,workstream,likelihood,impact,mitigation,owner) VALUES (?,?,?,?,?,?,?,?)`, [id, req.params.pid, description, workstream, likelihood, impact, mitigation, owner], function(e) { res.json({ ok: true }); });
+    if (!id) return res.status(400).json({ error: 'Risk ID required' });
+    db.run(`INSERT INTO risks (id,project_id,description,workstream,likelihood,impact,mitigation,owner) VALUES (?,?,?,?,?,?,?,?)`, [id, req.params.pid, description, workstream, likelihood, impact, mitigation, owner], function(e) {
+        if (e) return res.status(500).json({ error: e.message });
+        res.json({ ok: true });
+    });
+});
+
+app.delete('/api/projects/:pid/risks/:id', auth, reqRole('teamlead'), (req, res) => {
+    db.run("DELETE FROM risks WHERE id=? AND project_id=?", [req.params.id, req.params.pid], function(e) {
+        if (e) return res.status(500).json({ error: 'Database error' });
+        res.json({ changes: this.changes });
+    });
 });
 
 // STATS
 app.get('/api/projects/:pid/stats', auth, (req, res) => {
     const stats = {};
     db.serialize(() => {
-        db.get("SELECT COUNT(*) as total FROM tasks WHERE project_id=?", [req.params.pid], (e, r) => { stats.totalTasks = r?.total || 0; });
-        db.all("SELECT status, COUNT(*) as count FROM tasks WHERE project_id=? GROUP BY status", [req.params.pid], (e, r) => { stats.byStatus = r || []; });
-        db.all("SELECT workstream, COUNT(*) as total, SUM(CASE WHEN status='Complete' THEN 1 ELSE 0 END) as complete, AVG(percent_complete) as progress FROM tasks WHERE project_id=? GROUP BY workstream", [req.params.pid], (e, r) => { stats.byWorkstream = r || []; res.json(stats); });
+        db.get("SELECT COUNT(*) as total FROM tasks WHERE project_id=?", [req.params.pid], (e, r) => {
+            if (e) return res.status(500).json({ error: 'Database error' });
+            stats.totalTasks = r?.total || 0;
+        });
+        db.all("SELECT status, COUNT(*) as count FROM tasks WHERE project_id=? GROUP BY status", [req.params.pid], (e, r) => {
+            if (e) return res.status(500).json({ error: 'Database error' });
+            stats.byStatus = r || [];
+        });
+        db.all("SELECT workstream, COUNT(*) as total, SUM(CASE WHEN status='Complete' THEN 1 ELSE 0 END) as complete, AVG(percent_complete) as progress FROM tasks WHERE project_id=? GROUP BY workstream", [req.params.pid], (e, r) => {
+            if (e) return res.status(500).json({ error: 'Database error' });
+            stats.byWorkstream = r || [];
+            res.json(stats);
+        });
     });
+});
+
+// Multer error handling middleware
+app.use((err, req, res, next) => {
+    if (err instanceof multer.MulterError) {
+        if (err.code === 'LIMIT_FILE_SIZE') return res.status(400).json({ error: 'File too large (max 10MB)' });
+        return res.status(400).json({ error: err.message });
+    }
+    if (err.message === 'File type not allowed') return res.status(400).json({ error: 'File type not allowed. Accepted: pdf, doc, docx, xls, xlsx, ppt, pptx, png, jpg, gif, txt, csv, zip, msg, eml' });
+    next(err);
 });
 
 app.listen(PORT, () => {

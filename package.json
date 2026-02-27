@@ -1,6 +1,6 @@
 {
   "name": "it-tracker-selfhosted",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "IT Integration Tracker - Self-hosted M&A project management",
   "main": "server.js",
   "scripts": {
