@@ -94,7 +94,7 @@ function initDefaults() {
     db.get("SELECT COUNT(*) as c FROM users", (e, r) => { if (r?.c === 0) db.run(`INSERT INTO users (username, password, display_name, role) VALUES (?, ?, ?, ?)`, ['admin', hash('admin123'), 'Administrator', 'admin']); });
     db.get("SELECT COUNT(*) as c FROM default_workstreams", (e, r) => {
         if (r?.c === 0) {
-            [['Office 365','#0078d4',1],['Network','#38a169',2],['Cybersecurity','#e53e3e',3],['Active Directory','#805ad5',4],['Applications','#dd6b20',5],['Communications','#319795',6]].forEach(w => db.run(`INSERT INTO default_workstreams (name,color,sort_order) VALUES (?,?,?)`, w));
+            [['Office 365','#0078d4',1],['Network','#38a169',2],['Cybersecurity','#e53e3e',3],['Active Directory','#805ad5',4],['Applications','#dd6b20',5],['Communications','#319795',6],['Human Resources','#d53f8c',7]].forEach(w => db.run(`INSERT INTO default_workstreams (name,color,sort_order) VALUES (?,?,?)`, w));
         }
     });
     db.get("SELECT COUNT(*) as c FROM default_tasks", (e, r) => { if (r?.c === 0) seedDefaultTasks(); });
@@ -138,7 +138,19 @@ function seedDefaultTasks() {
         ['COM-001','Communications','Phone assessment','Document systems','Medium','',1],
         ['COM-002','Communications','UC planning','Plan Teams/VoIP','Medium','COM-001',2],
         ['COM-003','Communications','Number porting','Transfer numbers','Medium','COM-002',3],
-        ['COM-004','Communications','Conference rooms','Standardize tech','Low','COM-002',4]
+        ['COM-004','Communications','Conference rooms','Standardize tech','Low','COM-002',4],
+        ['HR-001','Human Resources','Employee policy review','Review and compare employee handbooks, PTO, benefits, and workplace policies between acquired and parent companies','High','',1],
+        ['HR-002','Human Resources','Policy gap analysis','Identify differences in HR policies including code of conduct, harassment, remote work, and disciplinary procedures','High','HR-001',2],
+        ['HR-003','Human Resources','Unified policy development','Draft consolidated employee policies aligned to parent company standards','High','HR-002',3],
+        ['HR-004','Human Resources','Master user list compilation','Compile comprehensive list of all employees from acquired company with name, title, department, location, email, and system access','Critical','',4],
+        ['HR-005','Human Resources','User list reconciliation','Cross-reference master user list against AD, O365, application access, and badge systems to identify discrepancies','Critical','HR-004',5],
+        ['HR-006','Human Resources','Org chart alignment','Map acquired company org structure to parent company hierarchy and reporting lines','High','HR-004',6],
+        ['HR-007','Human Resources','Benefits integration','Plan transition of health insurance, 401k, and other employee benefits to parent company programs','High','HR-001',7],
+        ['HR-008','Human Resources','Payroll system integration','Coordinate payroll system migration and ensure continuity of pay cycles','High','HR-004',8],
+        ['HR-009','Human Resources','Employee communications plan','Develop communication strategy for policy changes, system migrations, and integration milestones','Medium','HR-003',9],
+        ['HR-010','Human Resources','Onboarding package update','Update new employee onboarding materials to reflect integrated systems, policies, and contacts','Medium','HR-003',10],
+        ['HR-011','Human Resources','Compliance verification','Verify all HR practices meet federal, state, and local employment law requirements post-integration','High','HR-003',11],
+        ['HR-012','Human Resources','Contractor/vendor audit','Identify and document all contractors, temps, and third-party vendors with system access from acquired company','High','HR-004',12]
     ];
     t.forEach(x => db.run(`INSERT INTO default_tasks (id,workstream,name,description,priority,dependencies,sort_order) VALUES (?,?,?,?,?,?,?)`, x));
 }
@@ -153,8 +165,8 @@ function seedProjectData(pid) {
     db.all("SELECT * FROM default_tasks WHERE active=1", (e, tasks) => {
         if (tasks) tasks.forEach(t => db.run(`INSERT INTO tasks (id,project_id,workstream,name,description,priority,status,percent_complete,dependencies) VALUES (?,?,?,?,?,?,?,?,?)`, [t.id,pid,t.workstream,t.name,t.description,t.priority,'Not Started',0,t.dependencies]));
     });
-    [['IT Director','Acquired','Office 365'],['Network Admin','Acquired','Network'],['Security Manager','Acquired','Cybersecurity'],['IT Director','Applied','Office 365'],['CISO','Applied','Cybersecurity']].forEach(c => db.run(`INSERT INTO contacts (project_id,role,company,workstream) VALUES (?,?,?,?)`, [pid,c[0],c[1],c[2]]));
-    [['RISK-001','Data loss during migration','Office 365','Medium','High','Comprehensive backup'],['RISK-002','Network connectivity issues','Network','Medium','High','Redundant connections'],['RISK-003','Security vulnerabilities','Cybersecurity','High','High','Security assessment']].forEach(r => db.run(`INSERT INTO risks (id,project_id,description,workstream,likelihood,impact,mitigation) VALUES (?,?,?,?,?,?,?)`, [r[0],pid,r[1],r[2],r[3],r[4],r[5]]));
+    [['IT Director','Acquired','Office 365'],['Network Admin','Acquired','Network'],['Security Manager','Acquired','Cybersecurity'],['IT Director','Applied','Office 365'],['CISO','Applied','Cybersecurity'],['HR Director','Acquired','Human Resources'],['HR Business Partner','Applied','Human Resources']].forEach(c => db.run(`INSERT INTO contacts (project_id,role,company,workstream) VALUES (?,?,?,?)`, [pid,c[0],c[1],c[2]]));
+    [['RISK-001','Data loss during migration','Office 365','Medium','High','Comprehensive backup'],['RISK-002','Network connectivity issues','Network','Medium','High','Redundant connections'],['RISK-003','Security vulnerabilities','Cybersecurity','High','High','Security assessment'],['RISK-004','Incomplete employee records','Human Resources','Medium','High','Cross-reference multiple systems and conduct manager verification'],['RISK-005','Policy compliance gaps','Human Resources','Medium','Medium','Legal review of all consolidated policies before rollout']].forEach(r => db.run(`INSERT INTO risks (id,project_id,description,workstream,likelihood,impact,mitigation) VALUES (?,?,?,?,?,?,?)`, [r[0],pid,r[1],r[2],r[3],r[4],r[5]]));
 }
 
 // AUTH - with rate limiting
